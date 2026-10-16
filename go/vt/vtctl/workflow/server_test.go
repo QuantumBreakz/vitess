@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/prototext"
 
+	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/ptr"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/test/utils"
@@ -3652,4 +3653,84 @@ func TestMigrateAllowsSourceEqualsTarget(t *testing.T) {
 		MountName:      "ext1",
 	})
 	require.NotContains(t, err.Error(), "source and target keyspace must be different for MoveTables workflows")
+}
+
+// TestWorkflowStatusLag tests that WorkflowStatus reports how far a stream lags,
+// and that its VStream may not be running once time_updated is too old.
+func TestWorkflowStatusLag(t *testing.T) {
+	ctx := t.Context()
+	now := time.Now()
+	testCases := []struct {
+		name           string
+		timeUpdated    time.Time
+		txTimestamp    time.Time
+		wantLag        string // regexp, the clock may tick between setup and check
+		wantNotRunning bool
+	}{
+		{
+			name:        "running, 30s behind",
+			timeUpdated: now,
+			txTimestamp: now.Add(-30 * time.Second),
+			wantLag:     `VStream Lag: 3[01]s; Tx time: `,
+		},
+		{
+			name:           "not updated for 90s",
+			timeUpdated:    now.Add(-90 * time.Second),
+			txTimestamp:    now.Add(-90 * time.Second),
+			wantLag:        `VStream Lag: 9[01]s; Tx time: `,
+			wantNotRunning: true,
+		},
+		{
+			name:        "no transactions after copy",
+			timeUpdated: now.Add(-5 * time.Second),
+			wantLag:     `^VStream Lag: [56]s$`,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sourceKeyspace := &testKeyspace{KeyspaceName: "sourceks", ShardNames: []string{"0"}}
+			targetKeyspace := &testKeyspace{KeyspaceName: "targetks", ShardNames: []string{"0"}}
+			env := newTestEnv(t, ctx, defaultCellName, sourceKeyspace, targetKeyspace)
+			defer env.close()
+			env.tmc.schema = map[string]*tabletmanagerdatapb.SchemaDefinition{"t1": {}}
+
+			stream := &tabletmanagerdatapb.ReadVReplicationWorkflowResponse_Stream{
+				Id:    1,
+				State: binlogdatapb.VReplicationWorkflowState_Running,
+				Bls: &binlogdatapb.BinlogSource{
+					Keyspace: sourceKeyspace.KeyspaceName,
+					Shard:    "0",
+					Filter:   &binlogdatapb.Filter{Rules: []*binlogdatapb.Rule{{Match: "t1", Filter: "select * from t1"}}},
+				},
+				Pos:         position,
+				TimeUpdated: protoutil.TimeToProto(tc.timeUpdated),
+			}
+			if !tc.txTimestamp.IsZero() {
+				stream.TransactionTimestamp = protoutil.TimeToProto(tc.txTimestamp)
+			}
+			resp := &tabletmanagerdatapb.ReadVReplicationWorkflowsResponse{
+				Workflows: []*tabletmanagerdatapb.ReadVReplicationWorkflowResponse{{
+					Workflow:     "wf1",
+					WorkflowType: binlogdatapb.VReplicationWorkflowType_MoveTables,
+					Streams:      []*tabletmanagerdatapb.ReadVReplicationWorkflowResponse_Stream{stream},
+				}},
+			}
+			// Return the stream for each read of the workflow.
+			for range 2 {
+				env.tmc.AddVReplicationWorkflowsResponse(env.tmc.GetWorkflowKey(targetKeyspace.KeyspaceName, "0"), resp)
+			}
+			// The stream is not copying.
+			env.tmc.expectVRQuery(200, "select distinct table_name from _vt.copy_state cs, _vt.vreplication vr where vr.id = cs.vrepl_id and vr.id = 1", &sqltypes.Result{})
+			env.tmc.expectVRQuery(200, "select vrepl_id, table_name, lastpk from _vt.copy_state where vrepl_id in (1) and id in (select max(id) from _vt.copy_state where vrepl_id in (1) group by vrepl_id, table_name)", &sqltypes.Result{})
+
+			res, err := env.ws.WorkflowStatus(ctx, &vtctldatapb.WorkflowStatusRequest{
+				Keyspace: targetKeyspace.KeyspaceName,
+				Workflow: "wf1",
+			})
+			require.NoError(t, err)
+			info := res.ShardStreams["targetks/0"].Streams[0].Info
+			assert.Equal(t, tc.wantNotRunning, strings.HasPrefix(info, "VStream may not be running; "), info)
+			assert.Regexp(t, tc.wantLag, info)
+		})
+	}
 }

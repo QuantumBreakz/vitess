@@ -63,7 +63,6 @@ import (
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
-	vttimepb "vitess.io/vitess/go/vt/proto/vttime"
 )
 
 const (
@@ -1725,6 +1724,12 @@ func (s *Server) WorkflowDelete(ctx context.Context, req *vtctldatapb.WorkflowDe
 	return response, nil
 }
 
+// streamNotRunningThresholdSecs is how long a stream's time_updated can go
+// unchanged before WorkflowStatus reports that its VStream may not be running.
+// A running stream updates it at least every 60 seconds, the maximum
+// --vreplication-heartbeat-update-interval.
+const streamNotRunningThresholdSecs = 60
+
 func (s *Server) WorkflowStatus(ctx context.Context, req *vtctldatapb.WorkflowStatusRequest) (*vtctldatapb.WorkflowStatusResponse, error) {
 	ts, state, err := s.getWorkflowState(ctx, req.Keyspace, req.Workflow)
 	if err != nil {
@@ -1802,18 +1807,17 @@ func (s *Server) WorkflowStatus(ctx context.Context, req *vtctldatapb.WorkflowSt
 			} else if st.Position == "" {
 				info = append(info, "VStream has not started")
 			} else {
-				now := time.Now().Nanosecond()
-				updateLag := int64(now) - st.TimeUpdated.Seconds
-				if updateLag > 0*1e9 {
+				now := time.Now().Unix()
+				timeUpdated := st.GetTimeUpdated().GetSeconds()
+				if now-timeUpdated > streamNotRunningThresholdSecs {
 					info = append(info, "VStream may not be running")
 				}
-				if st.TransactionTimestamp == nil {
-					st.TransactionTimestamp = &vttimepb.Time{}
-				}
-				txLag := int64(now) - st.TransactionTimestamp.Seconds
-				info = append(info, fmt.Sprintf("VStream Lag: %ds", txLag/1e9))
-				if st.TransactionTimestamp.Seconds > 0 { // if no events occur after copy phase, TransactionTimeStamp can be 0
-					info = append(info, fmt.Sprintf("; Tx time: %s.", time.Unix(st.TransactionTimestamp.Seconds, 0).Format(time.ANSIC)))
+				txTime := st.GetTransactionTimestamp().GetSeconds()
+				if txTime == 0 { // if no events occur after copy phase, TransactionTimeStamp can be 0
+					info = append(info, fmt.Sprintf("VStream Lag: %ds", now-timeUpdated))
+				} else {
+					info = append(info, fmt.Sprintf("VStream Lag: %ds", now-txTime))
+					info = append(info, fmt.Sprintf("Tx time: %s.", time.Unix(txTime, 0).Format(time.ANSIC)))
 				}
 			}
 			ts.Id = int32(st.Id)
